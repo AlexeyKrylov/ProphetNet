@@ -14,7 +14,7 @@ import tempfile
 import warnings
 from collections import defaultdict
 from contextlib import contextmanager
-# import wandb
+import wandb
 
 DEBUG = 10
 INFO = 20
@@ -367,7 +367,7 @@ class Logger(object):
             if self.comm.rank != 0:
                 d["dummy"] = 1  # so we don't get a warning about empty dict
         # LISA
-        # wandb.log({**d})
+        wandb.log({**d})
         out = d.copy()  # Return the dict for unit testing purposes
         for fmt in self.output_formats:
             if isinstance(fmt, KVWriter):

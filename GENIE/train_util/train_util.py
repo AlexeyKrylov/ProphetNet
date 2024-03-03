@@ -5,7 +5,7 @@ from torch import nn
 import collections
 from util import logger
 from train_util import dist_util
-from transformers import AdamW
+from torch.optim import AdamW
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
@@ -106,7 +106,7 @@ class TrainLoop:
                             model_checkpoint_files.append(item.path)
                         if "ema" in item.path:
                             ema_checkpoint_files.append(item.path)
-                if len(model_checkpoint_files) != 0 and len(ema_checkpoint_files) != 0:
+                if len(model_checkpoint_files) != 0 and len(ema_checkpoint_files) != 0 and self.resume_checkpoint:
                     model_checkpoint_files.sort(key=lambda f: int(f.split('model_checkpoint-')[1]), reverse=True)
                     logger.info("***** load " + model_checkpoint_files[0] + " *****")
                     ema_checkpoint_files.sort(key=lambda f: int(f.split('checkpoint-')[-1]), reverse=True)
@@ -128,15 +128,27 @@ class TrainLoop:
             ]
 
         # model to DDP
-        if dist.get_world_size() > 1:
-            self.model = DDP(
-                self.model, device_ids=[dist.get_rank()], output_device=dist.get_rank(), find_unused_parameters=False,
-            )
-        else:
-            print("single GPU is not achieve now")
-            exit(0)
+        # if dist.get_world_size() > 1:
+        # self.model = DDP(
+        #     self.model, device_ids=[0], output_device=0, find_unused_parameters=False,
+        # )
+        print(dist_util.dev())
+        self.ddp_model = DDP(
+            self.model,
+            device_ids=[dist_util.dev()],
+            output_device=dist_util.dev(),
+            broadcast_buffers=False,
+            bucket_cap_mb=128,
+            find_unused_parameters=False,
+        )
+        # else:
+        #     print("single GPU is not achieve now")
+        #     exit(0)
 
     def run_loop(self):
+        best_eval_loss_save = 10000000
+        evl = 10000000
+
         logger.info("***** Running training *****")
         logger.info("  Max steps = %d", self.lr_anneal_steps)
         logger.info("  Instantaneous batch size per GPU = %d", self.batch_size)
@@ -154,14 +166,14 @@ class TrainLoop:
         if self.train_type == 'LM_Diffusion':
             train_sample = DistributedSampler(self.data)
             train_dataloader = DataLoader(self.data, sampler=train_sample, batch_size=self.batch_size, drop_last=False,
-                                          num_workers=20, collate_fn=Question_dataset.get_collate_fn())
+                                          num_workers=0, collate_fn=Question_dataset.get_collate_fn())
         elif self.train_type == 'S2S_Diffusion':
-            train_sample = DistributedSampler(self.data)
+            # train_sample = DistributedSampler(self.data)
             '''
             for s2s
             '''
-            train_dataloader = DataLoader(self.data, sampler=train_sample, batch_size=self.batch_size, drop_last=False,
-                                      num_workers=20, collate_fn=S2S_dataset.get_collate_fn())
+            train_dataloader = DataLoader(self.data, batch_size=self.batch_size, drop_last=False,
+                                      num_workers=0, collate_fn=S2S_dataset.get_collate_fn(), shuffle=True)
         else:
             return NotImplementedError
 
@@ -175,7 +187,7 @@ class TrainLoop:
                 # forward loss
                 self.forward_backward(batch)
                 if self.use_fp16:
-                    pass
+                    raise ValueError
                 else:
                     # gradient clip
                     if self.gradient_clipping > 0:
@@ -184,44 +196,63 @@ class TrainLoop:
                     self.optimizer.step()
                     # lr scheduler
                     self.scheduler.step()
+                    self.lr = np.float64(self.scheduler.get_lr()[0])
                     self.model.zero_grad()
                     # ema
                     for rate, params in zip(self.ema_rate, self.ema_params):
                         self.update_ema(params, self.master_params, rate=rate)
+
                 self.global_step += 1
+
+                # with torch.no_grad():
+                #     if self.global_step % 30000 == 0:
+                #         logger.info("Load EMA params.")
+                #         self.master_params = copy.deepcopy(self.ema_params[0])
+                #         pp = 0
+                #         for param in self.model.parameters():
+                #             param.data = self.master_params[pp]
+                #             param.requires_grad = True
+                #             pp += 1
+                #         self.master_params = list(self.model.parameters())
+
                 self.log_step()
 
                 if self.global_step % self.log_interval == 0:
                     logger.dumpkvs()
-
                 if self.eval_data is not None and self.global_step % self.eval_interval == 0:
                     if dist.get_rank() == 0:
                         print('eval on validation set...')
                         if self.train_type == 'LM_Diffusion':
                             dev_dataloader = DataLoader(self.eval_data, batch_size=self.batch_size,
                                                           drop_last=False,
-                                                          num_workers=20, collate_fn=Question_dataset.get_collate_fn())
+                                                          num_workers=0, collate_fn=Question_dataset.get_collate_fn())
                         elif self.train_type == 'S2S_Diffusion':
                             '''
                             for s2s
                             '''
                             dev_dataloader = DataLoader(self.eval_data, batch_size=self.batch_size,
                                                         drop_last=False,
-                                                        num_workers=20, collate_fn=S2S_dataset.get_collate_fn())
+                                                        num_workers=0, collate_fn=S2S_dataset.get_collate_fn())
                         else:
                             return NotImplementedError
+                        evl = 0
                         for step, batch in enumerate(dev_dataloader):
-                            self.forward_only(batch)
-                            if step > 10:
+                            evl += self.forward_only(batch).mean() / 30.0
+                            if step > 30:
                                 break
+
                         logger.dumpkvs()
                 # save
+                if evl < best_eval_loss_save:
+                    best_eval_loss_save = evl
+                    print(best_eval_loss_save)
+                    self.save(current=True)
                 if self.global_step % self.save_interval == 0:
                     self.save()
 
-    def save(self):
+    def save(self, current=False):
 
-        def save_checkpoint(rate, ema_params):
+        def save_checkpoint(rate, ema_params, current=False):
             model_to_save = get_model_obj(self.model)
             if not rate:
                 model_state_dict = model_to_save.state_dict()
@@ -244,13 +275,18 @@ class TrainLoop:
             else:
                 ckpt_path = os.path.join(self.checkpoint_path, 'ema_' + str(rate) + '_checkpoint-' + str(offset))
 
-            torch.save(state._asdict(), ckpt_path)
-            logger.info('Saved checkpoint at %s', ckpt_path)
+            if current:
+                torch.save(state._asdict(), os.path.join(self.checkpoint_path, 'best_checkpoint'))
+                logger.info('Saved checkpoint at best_checkpoint')
+            else:
+                torch.save(state._asdict(), ckpt_path)
+                logger.info('Saved checkpoint at %s', ckpt_path)
 
         if dist.get_rank() == 0:
-            save_checkpoint(0, None)
-            for rate, params in zip(self.ema_rate, self.ema_params):
-                save_checkpoint(rate, params)
+            save_checkpoint(0, None, current=current)
+            if not current:
+                for rate, params in zip(self.ema_rate, self.ema_params):
+                    save_checkpoint(rate, params)
 
 
     def forward_backward(self, batch):
@@ -308,6 +344,7 @@ class TrainLoop:
             log_loss_dict(
                 self.diffusion, t, {f"eval_{k}": v * weights for k, v in losses.items()}
             )
+            return {k: v * weights for k, v in losses.items()}['nll']
 
     def _log_grad_norm(self):
         sqsum = 0.0
@@ -318,8 +355,10 @@ class TrainLoop:
 
     def log_step(self):
         logger.logkv("step", self.global_step)
+        logger.logkv("lr", self.lr)
         if self.use_fp16:
             logger.logkv("lg_loss_scale", self.lg_loss_scale)
+
 
     def _anneal_lr(self):
         if not self.lr_anneal_steps:
@@ -328,6 +367,7 @@ class TrainLoop:
         lr = self.lr * (1 - frac_done)
         for param_group in self.optimizer.param_groups:
             param_group["lr"] = lr
+
 
     def grad_clip(self):
         # print('doing gradient clipping')

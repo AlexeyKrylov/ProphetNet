@@ -5,6 +5,8 @@ from util.util import (
     create_model_and_diffusion,
     args_to_dict,
 )
+import pickle
+import jsonlines
 # from transformers import set_seed
 import torch
 import collections
@@ -12,40 +14,55 @@ import argparse
 from transformers import AutoTokenizer
 import numpy as np
 from functools import partial
-from data_util.s2s_data_util import load_s2s_data
 import torch.distributed as dist
-from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from data_util.s2s_data_util import S2S_dataset, QG_dataset_Diff
 from torch.serialization import default_restore_location
-
-
+import torch
+from datasets import load_metric
+from torch.nn.functional import softmax
 from transformers import (
-    BertModel,
-    BertConfig,
     AutoTokenizer,
 )
-from data_util.text_data_util import load_data_text
 from tqdm import tqdm
 import random
 
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+
+def get_bleu(recover, reference):
+    return sentence_bleu([reference.split()], recover.split(), smoothing_function=SmoothingFunction().method4,)
+
+def postprocess_text(preds, labels):
+    preds = [pred.strip().lower() for pred in preds]
+    labels = [label.strip().lower() for label in labels]
+    labels = [[label] for label in labels]
+    return preds, labels
+
+# metric_name = "/home/etutubalina/somov_students/krylov_as/sacrebleu.py"
+metric_name = "sacrebleu"
+
+metric = load_metric(metric_name)
+def get_sacrebleu(decoded_preds, decoded_labels):
+    decoded_preds, decoded_labels = postprocess_text(decoded_preds, decoded_labels)
+    result = metric.compute(predictions=decoded_preds, references=decoded_labels)['score']
+    return result
 
 def get_arguments():
     parser = argparse.ArgumentParser()
 
     # out path
-    parser.add_argument('--generate_path', type=str, default='', help='output path')
-    parser.add_argument('--eval_model_path', type=str, default='', help='model path')
-    parser.add_argument('--num_samples', type=int, default=50, help='sample query')
+    parser.add_argument('--generate_path', type=str, default='./', help='output path')
+    parser.add_argument('--eval_model_path', type=str, default='./checkpoint-path/GENIE_ToTTo/model_checkpoint-1000', help='model path')
+    parser.add_argument('--num_samples', type=int, default=1, help='sample query')
     parser.add_argument('--interval_step', type=int, default=1, help='inference t interval step')
 
     # load model
-    parser.add_argument('--model_arch', type=str, default='transformer', help='Core architecture of diffusion model')
-    parser.add_argument('--model_channels', type=int, default=768,
+    parser.add_argument('--model_arch', type=str, default='s2s_CAT', help='Core architecture of diffusion model')
+    parser.add_argument('--model_channels', type=int, default=128,
                         help='Try to set it to the same size as the model hidden')
-    parser.add_argument('--in_channel', type=int, default=768,
+    parser.add_argument('--in_channel', type=int, default=128,
                         help='The input chanel size here must be the same as the word embedding size')
-    parser.add_argument('--out_channel', type=int, default=768,
+    parser.add_argument('--out_channel', type=int, default=128,
                         help='The dimension size of the output is recommended to be the same as that of word embedding for easy reasoning')
     parser.add_argument('--dropout', type=float, default=0.1, help='')
     parser.add_argument("--learn_sigma", default=False, action="store_true", help="Whether to learning variance")
@@ -58,29 +75,30 @@ def get_arguments():
 
     # load diffusion
     # parser.add_argument('--model_arch', type=str, default='transformer', help='Core architecture of diffusion model')
+    parser.add_argument('--noise_factor', type=int, default=1, help='Noise Factor')
     parser.add_argument('--diffusion_steps', type=int, default=2000, help='Diffusion model maximum T')
     # parser.add_argument("--learn_sigma", default=False, action="store_true", help="Whether to learning variance")
     parser.add_argument('--use_kl', default=False, action="store_true",
                         help="Whether to using kl loss in Diffsion loss")
-    parser.add_argument('--training_mode', type=str, default='e2e', help='using e2e simple loss or e2e loss')
+    parser.add_argument('--training_mode', type=str, default='s2s', help='using e2e simple loss or e2e loss')
     parser.add_argument('--noise_schedule', type=str, default='sqrt',
                         help='How to plan the noise change of Gaussian distribution')
-    parser.add_argument('--predict_xstart', default=False, action="store_true",
+    parser.add_argument('--predict_xstart', default=True, action="store_true",
                         help="Model prediction target, if True, predict xstart, if False, predict EPSILON")
     parser.add_argument("--sigma_small", default=False, action="store_true", help="about learning variance")
     parser.add_argument("--rescale_learned_sigmas", default=True, action="store_false", help="about learning variance")
     parser.add_argument("--rescale_timesteps", default=True, action="store_false", help="about time rescale")
 
     # data args
-    parser.add_argument('--data_path', type=str, default='', help='data path')
-    parser.add_argument('--data_name', type=str, default='', help='data name')
+    parser.add_argument('--data_path', type=str, default='./datasets/',help='data path')
+    parser.add_argument('--data_name', type=str, default='ToTTo/', help='data name')
     # for seq2seq
-    parser.add_argument('--src_max_len', type=int, default=144, help='src max len')
-    parser.add_argument('--tgt_max_len', type=int, default=32, help='tgt max len')
+    parser.add_argument('--src_max_len', type=int, default=512, help='src max len')
+    parser.add_argument('--tgt_max_len', type=int, default=128, help='tgt max len')
     parser.add_argument('--answer_max_len', type=int, default=10, help='tgt max len')
 
     # gen args
-    parser.add_argument('--batch_size', type=int, default=64, help='')
+    parser.add_argument('--batch_size', type=int, default=128, help='')
 
     # seed
     parser.add_argument('--seed', type=int, default=101, help='')
@@ -199,8 +217,7 @@ def main():
     # setup_seed(args.seed)
     setup_env(args)
 
-    if dist.get_rank() == 0:
-        if not os.path.exists(args.generate_path):
+    if not os.path.exists(args.generate_path):
             os.makedirs(args.generate_path)
 
     log_path = os.path.join(args.generate_path, 'log')
@@ -212,185 +229,206 @@ def main():
     model, diffusion = create_model_and_diffusion(
         args
     )
+
+    # model.resize_token_embeddings(12)
+
     model.to(args.device)
     model.eval()
     # load trained model
-    model_saved_state = load_states_from_checkpoint(args.eval_model_path)
-    model.load_state_dict(model_saved_state.model_dict)
 
-    pytorch_total_params = sum(p.numel() for p in model.parameters())
-    logger.log(f'the parameter count is {pytorch_total_params}')
+    for ppath in [f'./checkpoint-path/GENIE_ToTTo/ema_0.9999_checkpoint-{str(i)}' for i in range(80000, 130001, 10000)] +\
+            [f'./checkpoint-path/GENIE_ToTTo/model_checkpoint-{str(i)}' for i in range(110000, 230001, 10000)] +\
+    [f'./checkpoint-path/GENIE_ToTTo/ema_0.9999_checkpoint-{str(i)}' for i in range(140000, 230001, 10000)]:
 
-    if dist.get_world_size() > 1:
-        model = DDP(
-            model, device_ids=[dist.get_rank()], output_device=dist.get_rank(), find_unused_parameters=False,
+    # for ppath in [f'./checkpoint-path/GENIE_ToTTo_EMA/model_checkpoint-{str(i)}' for i in
+    #                   range(210000, 210001, 10000)]:
+
+        # model_saved_state = load_states_from_checkpoint(args.eval_model_path)
+        model_saved_state = load_states_from_checkpoint(ppath)
+
+        model.load_state_dict(model_saved_state.model_dict)
+
+        pytorch_total_params = sum(p.numel() for p in model.parameters())
+        logger.log(f'the parameter count is {pytorch_total_params}')
+
+        # model = DDP(
+        #         model, device_ids=[0], output_device=0, find_unused_parameters=False,
+        #     )
+
+        logger.log("sampling text from random noise...")
+        # print("sample num is :", args.num_samples)
+        # print("sample interval step is :", args.interval_step)
+        # print("total inverse diffusion step is :", 2000 // args.interval_step)
+
+        sample_fn = (
+            diffusion.p_sample_loop
         )
 
-    logger.log("sampling text from random noise...")
-    print("sample num is :", args.num_samples)
-    print("sample interval step is :", args.interval_step)
-    print("total inverse diffusion step is :", 2000 // args.interval_step)
-
-    sample_fn = (
-        diffusion.p_sample_loop
-    )
-
-    if dist.get_world_size() > 1:
-        emb_model = model.module.word_embedding
-    else:
         emb_model = model.word_embedding
 
-    if args.model_arch == 'transformer':
+        if args.model_arch == 'transformer':
 
-        sample_shape = (args.num_samples, args.text_max_len, args.in_channel)
-        sample = sample_fn(
-            model,
-            sample_shape,
-            clip_denoised=False,
-            denoised_fn=partial(denoised_fn_round, args, emb_model.cuda()),
-            model_kwargs=None,
-            top_p=-1.0,
-        )
-        print("sample result shape: ", sample.shape)
-        print('decoding for e2e... ')
+            sample_shape = (args.num_samples, args.text_max_len, args.in_channel)
+            sample = sample_fn(
+                model,
+                sample_shape,
+                clip_denoised=False,
+                denoised_fn=partial(denoised_fn_round, args, emb_model.cuda()),
+                model_kwargs=None,
+                top_p=-1.0,
+            )
+            # print("sample result shape: ", sample.shape)
+            # print('decoding for e2e... ')
 
-        logits = model.get_logits(sample)
-        cands = torch.topk(logits, k=1, dim=-1)
-        sample_id_list = cands.indices
-        print("decode id list example :", type(sample_id_list[0]), "  ", sample_id_list[0])
+            logits = model.get_logits(sample)
+            cands = torch.topk(logits, k=1, dim=-1)
+            sample_id_list = cands.indices
+            # print("decode id list example :", type(sample_id_list[0]), "  ", sample_id_list[0])
 
-        logger.log("creating tokenizer...")
-        tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
-        for sample_id in sample_id_list:
-            sentence = tokenizer.decode(sample_id.squeeze())
-            print(sentence)
+            logger.log("creating tokenizer...")
+            tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
+            for sample_id in sample_id_list:
+                sentence = tokenizer.decode(sample_id.squeeze())
+                # print(sentence)
 
-    elif args.model_arch == 's2s_CAT':
+        elif args.model_arch == 's2s_CAT':
 
-        # bert tokenizer
-        tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
-        print("-------------------------------------------------------------")
-        print("start generate query from dev dataset, for every passage, we generate ", args.num_samples, " querys...")
-        print("-------------------------------------------------------------")
+            # bert tokenizer
+            tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
+            # print("-------------------------------------------------------------")
+            # print("start generate query from dev dataset, for every passage, we generate ", args.num_samples, " querys...")
+            # print("-------------------------------------------------------------")
 
-        print("***** load " + args.data_name + " test src dataset*****")
-        src = []
-        test_src_path = os.path.join(args.data_path, args.data_name + "/org_data/test.src")
-        with open(test_src_path, "r", encoding="utf-8") as ifile:
-            for line in tqdm(ifile):
-                line = line.strip()
-                text = line
-                src.append(text)
+            # print("***** load " + args.data_name + " test src and tgt dataset*****")
+            src = []
+            tgt = []
+            test_path = os.path.join(args.data_path, args.data_name + "/valid.jsonl")
+            with jsonlines.open(test_path) as reader:
+                for obj in reader:
+                    tgt.append(obj['trg'])
+                    src.append(obj['src'])
 
-        print("***** load " + args.data_name + " dev tgt dataset*****")
-        tgt = []
-        test_tgt_path = os.path.join(args.data_path, args.data_name + "/org_data/test.tgt")
-        with open(test_tgt_path, "r", encoding="utf-8") as ifile:
-            for line in tqdm(ifile):
-                line = line.strip()
-                text = line
-                tgt.append(text)
-
-        shard_size = len(src) // args.world_size
-        start_idx = args.local_rank * shard_size
-        end_idx = start_idx + shard_size
-        if args.local_rank == args.world_size - 1:
+            start_idx = 0
             end_idx = len(src)
-        scr_data_piece = src[start_idx:end_idx]
-        tgt_data_piece = tgt[start_idx:end_idx]
+            scr_data_piece = src[start_idx:end_idx]
+            tgt_data_piece = tgt[start_idx:end_idx]
 
-        print('generation for ', len(scr_data_piece), " src text from idx ", start_idx, " to ", end_idx)
-        if args.data_name == "squadqg_data":
-            test_dataset = QG_dataset_Diff(scr_data_piece, tgt_data_piece, tokenizer, src_maxlength=args.src_max_len,
-                                       answer_maxlength=args.answer_max_len, tgt_maxlength=args.tgt_max_len)
-            test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, drop_last=False,
-                                         num_workers=20, collate_fn=QG_dataset_Diff.get_collate_fn())
+            # print('generation for ', len(scr_data_piece), " src text from idx ", start_idx, " to ", end_idx)
+            if args.data_name == "squadqg_data":
+                test_dataset = QG_dataset_Diff(scr_data_piece, tgt_data_piece, tokenizer, src_maxlength=args.src_max_len,
+                                           answer_maxlength=args.answer_max_len, tgt_maxlength=args.tgt_max_len)
+                test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, drop_last=False,
+                                             num_workers=0, collate_fn=QG_dataset_Diff.get_collate_fn())
+            else:
+                test_dataset = S2S_dataset(scr_data_piece, tgt_data_piece, tokenizer, src_maxlength=args.src_max_len,
+                                           tgt_maxlength=args.tgt_max_len)
+                test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, drop_last=False,
+                                              num_workers=0, collate_fn=S2S_dataset.get_collate_fn())
+
+            if args.generate_path is not None:
+                # model_gen_files = []
+                # if os.path.exists(args.generate_path):
+                #     for item in os.scandir(args.generate_path):
+                #         if item.is_file():
+                #             if "gen_seed" in item.path:
+                #                 model_gen_files.append(item.path)
+                #     if len(model_gen_files) != 0 :
+                #         model_gen_files.sort(key=lambda f: int((f.split('_epoch')[-1]).split('.txt')[0]), reverse=True)
+                #         epoch_num = int((model_gen_files[0].split('_epoch')[-1]).split('.txt')[0])
+                #         logger.info("***** load " + model_gen_files[0] + " *****")
+                #     else:
+                epoch_num = 0
+
+            else:
+                logger.info("generate_path is None")
+                exit(0)
+
+            for epoch in range(args.num_samples - epoch_num):
+                each_sample_list = []
+                each_tgt_list = []
+                each_logits_list = []
+                # print("-------------------------------------------------------------")
+                # print("start sample ", epoch+1+epoch_num, " epoch...")
+                # print("-------------------------------------------------------------")
+
+                for index, batch in enumerate(tqdm(test_dataloader)):
+                    '''
+                    for s2s
+                    '''
+                    input_shape = (batch['src_input_ids'].shape[0], args.tgt_max_len, args.in_channel)
+                    src_input_ids = batch['src_input_ids']
+                    tgt_input_ids = batch['tgt_input_ids']
+                    # print(p_input_ids.shape)
+                    src_attention_mask = batch['src_attention_mask']
+                    model_kwargs = {'src_input_ids' : src_input_ids.cuda(), 'src_attention_mask': src_attention_mask.cuda()}
+                    # model_kwargs = {'src_input_ids' : src_input_ids, 'src_attention_mask': src_attention_mask}
+
+                    sample = sample_fn(
+                        model,
+                        input_shape,
+                        clip_denoised=False,
+                        denoised_fn=partial(denoised_fn_round, args, emb_model.cuda()),
+                        model_kwargs=model_kwargs,
+                        top_p=-1.0,
+                        interval_step=args.interval_step,
+                    )
+
+                    # print("sample result shape: ", sample.shape)
+                    # print('decoding for e2e... ')
+
+                    logits = model.get_logits(sample)
+                    each_logits_list.append(torch.max(softmax(logits, dim=-1), dim=-1))
+                    cands = torch.topk(logits, k=1, dim=-1)
+                    sample_id_list = cands.indices
+                    # print("decode id list example :", type(sample_id_list[0]), "  ", sample_id_list[0])
+
+                    '''
+                    for s2s
+                    '''
+                    # print("sample control generate query: ")
+                    for sample_id in range(len(sample_id_list)):
+                        sentence = tokenizer.decode(sample_id_list[sample_id].squeeze())
+                        each_sample_list.append(clean(sentence))
+                        each_tgt_list.append(clean(tokenizer.decode(tgt_input_ids[sample_id].squeeze(), clean_up_tokenization_spaces=True)))
+                        # print("src text: ", clean(tokenizer.decode(src_input_ids[sample_id].squeeze())))
+                        # print("tgt text: ", clean(tokenizer.decode(tgt_input_ids[sample_id].squeeze())))
+                        # print(clean(sentence))
+
+
+                    logger.log(ppath)
+                    logger.log("Accuracy = ", np.array([i == j for i, j in zip(each_sample_list, each_tgt_list)]).mean())
+                    logger.log("BLEU = ", np.array([get_bleu(i.lower(), j.lower()) for i, j in zip(each_sample_list, each_tgt_list)]).mean())
+                    logger.log("SacreBLEU = ", np.array([get_sacrebleu([i.lower()], [j.lower()]) for i, j in zip(each_sample_list, each_tgt_list)]).mean())
+
+                    logger.log(len(each_sample_list))
+
+                    # if len(each_sample_list) > 500:
+                    #     break
+
+                    # print(ppath)
+                    # print("Accuracy = ", np.array([i == j for i, j in zip(each_sample_list, each_tgt_list)]).mean())
+                    # print(len(each_sample_list))
+
+
+                out_path = os.path.join(args.generate_path, "rank" + str("0") + "_gen_seed_101" +
+                                        "_num" + str(args.num_samples) + "_epoch" + str(epoch + 1 + epoch_num) + ".txt")
+                with open(out_path, 'w') as f:
+                    for sentence in each_sample_list:
+                        f.write(sentence + '\n')
+
+                with open(os.path.join(args.generate_path, "rank" + str("0") + "_gen_seed_101" + \
+                                                           "_num" + str(args.num_samples) + "_epoch" + str(epoch + 1 + epoch_num) + "_logits.txt"), 'wb') as f:
+                    pickle.dump(each_logits_list, f)
+
         else:
-            test_dataset = S2S_dataset(scr_data_piece, tgt_data_piece, tokenizer, src_maxlength=args.src_max_len,
-                                       tgt_maxlength=args.tgt_max_len)
-            test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, drop_last=False,
-                                          num_workers=20, collate_fn=S2S_dataset.get_collate_fn())
-
-        if args.generate_path is not None:
-            model_gen_files = []
-            if os.path.exists(args.generate_path):
-                for item in os.scandir(args.generate_path):
-                    if item.is_file():
-                        if "gen_seed" in item.path:
-                            model_gen_files.append(item.path)
-                if len(model_gen_files) != 0 :
-                    model_gen_files.sort(key=lambda f: int((f.split('_epoch')[-1]).split('.txt')[0]), reverse=True)
-                    epoch_num = int((model_gen_files[0].split('_epoch')[-1]).split('.txt')[0])
-                    logger.info("***** load " + model_gen_files[0] + " *****")
-                else:
-                    epoch_num = 0
-
-        else:
-            logger.info("generate_path is None")
-            exit(0)
-
-        for epoch in range(args.num_samples - epoch_num):
-            each_sample_list = []
-            print("-------------------------------------------------------------")
-            print("start sample ", epoch+1+epoch_num, " epoch...")
-            print("-------------------------------------------------------------")
-
-            for index, batch in enumerate(tqdm(test_dataloader)):
-                '''
-                for s2s
-                '''
-                input_shape = (batch['src_input_ids'].shape[0], args.tgt_max_len, args.in_channel)
-                src_input_ids = batch['src_input_ids']
-                tgt_input_ids = batch['tgt_input_ids']
-                # print(p_input_ids.shape)
-                src_attention_mask = batch['src_attention_mask']
-                model_kwargs = {'src_input_ids' : src_input_ids, 'src_attention_mask': src_attention_mask}
-
-                sample = sample_fn(
-                    model,
-                    input_shape,
-                    clip_denoised=False,
-                    denoised_fn=partial(denoised_fn_round, args, emb_model.cuda()),
-                    model_kwargs=model_kwargs,
-                    top_p=-1.0,
-                    interval_step=args.interval_step,
-                )
-
-                print("sample result shape: ", sample.shape)
-                print('decoding for e2e... ')
-
-                logits = model.module.get_logits(sample)
-                cands = torch.topk(logits, k=1, dim=-1)
-                sample_id_list = cands.indices
-                #print("decode id list example :", type(sample_id_list[0]), "  ", sample_id_list[0])
-
-                '''
-                for s2s
-                '''
-                # print("src text: ", tokenizer.decode(src_input_ids.squeeze()))
-                # print("tgt text: ", tokenizer.decode(tgt_input_ids.squeeze()))
-
-                print("sample control generate query: ")
-                for sample_id in sample_id_list:
-                    sentence = tokenizer.decode(sample_id.squeeze())
-                    each_sample_list.append(clean(sentence))
-                    # print(sentence)
-
-            # total_sample_list.append(each_sample_list)
-            out_path = os.path.join(args.generate_path, "rank" + str(dist.get_rank()) + "_gen_seed_101" +
-                                    "_num" + str(args.num_samples) + "_epoch" + str(epoch + 1 + epoch_num) + ".txt")
-            with open(out_path, 'w') as f:
-                for sentence in each_sample_list:
-                    f.write(sentence + '\n')
-
-    else:
-        return NotImplementedError
+            return NotImplementedError
 
 def clean(sentence):
     sentence = sentence.replace('[CLS]', '')
     sentence = sentence.replace('[SEP]', '')
     sentence = sentence.replace('[PAD]', '')
     sentence = sentence.replace('[UNK]', 'unk')
+
     return sentence.strip()
 
 if __name__ == "__main__":

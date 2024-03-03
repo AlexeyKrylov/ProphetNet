@@ -224,9 +224,6 @@ class CrossAttention_Diffusion_LM(nn.Module):
         # self.passage_encoder = BertModel.from_pretrained(
         #     "/colab_space/Lin0/PROD/KDexp/pretrain_model/bert-base-uncased", config=cfg)
 
-
-
-
         config = BertConfig.from_pretrained(config_name)
         config.hidden_dropout_prob = self.dropout
         print(config)
@@ -305,6 +302,57 @@ class CrossAttention_Diffusion_LM(nn.Module):
     def get_embeds(self, input_ids):
         return self.word_embedding(input_ids)
 
+
+    def resize_token_embeddings(self, num_new_tokens=12):
+        # embedding_layer = self.word_embedding
+        #
+        # old_num_tokens, old_embedding_dim = embedding_layer.weight.shape
+        #
+        # # Creating new embedding layer with more entries
+        # new_embeddings = nn.Embedding(
+        #     old_num_tokens + num_new_tokens, old_embedding_dim
+        # )
+        #
+        # # Setting device and type accordingly
+        # new_embeddings.to(
+        #     embedding_layer.weight.device,
+        #     dtype=embedding_layer.weight.dtype,
+        # )
+        #
+        # # Copying the old entries
+        # new_embeddings.weight.data[:old_num_tokens, :] = embedding_layer.weight.data[
+        #                                                  :old_num_tokens, :
+        #                                                  ]
+        #
+        # self.word_embedding = new_embeddings
+        #
+        # with torch.no_grad():
+        #     self.lm_head.weight = self.word_embedding.weight
+
+
+        embedding_layer = self.passage_encoder.embeddings.word_embeddings
+
+        old_num_tokens, old_embedding_dim = embedding_layer.weight.shape
+
+        # Creating new embedding layer with more entries
+        new_embeddings = nn.Embedding(
+            old_num_tokens + num_new_tokens, old_embedding_dim
+        )
+
+        # Setting device and type accordingly
+        new_embeddings.to(
+            embedding_layer.weight.device,
+            dtype=embedding_layer.weight.dtype,
+        )
+
+        # Copying the old entries
+        new_embeddings.weight.data[:old_num_tokens, :] = embedding_layer.weight.data[
+                                                         :old_num_tokens, :
+                                                         ]
+
+        self.passage_encoder.embeddings.word_embeddings = new_embeddings
+
+
     def get_logits(self, hidden_repr):
         if self.logits_mode == 1:
             return self.lm_head(hidden_repr)
@@ -342,6 +390,8 @@ class CrossAttention_Diffusion_LM(nn.Module):
                                                  attention_mask=src_attention_mask)
                 passage_hidden = out.last_hidden_state
         else:
+            encoder_attention_mask_3d = rewrite_encoder_attention_mask(attention_mask, type_ids, row_ids, col_ids)
+
             out = self.passage_encoder(input_ids=src_input_ids,
                                        attention_mask=src_attention_mask)
             passage_hidden = out.last_hidden_state + 0 * out.pooler_output.unsqueeze(1)

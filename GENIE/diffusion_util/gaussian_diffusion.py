@@ -172,6 +172,7 @@ class GaussianDiffusion:
     def __init__(
         self,
         *,
+        args,
         betas,
         model_mean_type,
         model_var_type,
@@ -181,6 +182,7 @@ class GaussianDiffusion:
         training_mode='e2e',
         # model_arch='conv-unet',
     ):
+        self.noise_factor = args.noise_factor
         self.model_mean_type = model_mean_type
         self.model_var_type = model_var_type
         self.loss_type = loss_type
@@ -295,7 +297,7 @@ class GaussianDiffusion:
         :return: A noisy version of x_start.
         """
         if noise is None:
-            noise = th.randn_like(x_start)
+            noise = th.randn_like(x_start) * self.noise_factor
         assert noise.shape == x_start.shape
         return (
             _extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
@@ -627,15 +629,15 @@ class GaussianDiffusion:
         )
         if top_p is not None and top_p > 0:
             # print('top_p sampling')
-            noise = th.randn_like(x)
+            noise = th.randn_like(x) * self.noise_factor
             replace_mask = th.abs(noise) > top_p
             while replace_mask.any():
-                noise[replace_mask] = th.randn_like(noise[replace_mask])
+                noise[replace_mask] = th.randn_like(noise[replace_mask]) * self.noise_factor
                 replace_mask = th.abs(noise) > top_p
             assert (th.abs(noise) <= top_p).all()
 
         else:
-            noise = th.randn_like(x)
+            noise = th.randn_like(x) * self.noise_factor
         nonzero_mask = (
             (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
         )  # no noise when t == 0
@@ -692,7 +694,7 @@ class GaussianDiffusion:
         if noise is not None:
             img = noise
         else:
-            img = th.randn(*shape, device=device)
+            img = th.randn(*shape, device=device) * self.noise_factor
         indices = list(range(custom_t_start))[::-1]
 
         if progress:
@@ -757,7 +759,7 @@ class GaussianDiffusion:
             x_start = self.get_x_start(noise, std)
             forward_noise = None
             if forward_noise is None:
-                forward_noise = th.randn_like(x_start)
+                forward_noise = th.randn_like(x_start) * self.noise_factor
             # time step
             t = th.tensor([diffusion_start_step-1] * noise.shape[0]).to(noise.device)
             # print(t)
@@ -809,7 +811,7 @@ class GaussianDiffusion:
         if noise is not None:
             img = noise
         else:
-            img = th.randn(*shape, device=device)
+            img = th.randn(*shape, device=device) * self.noise_factor
         indices = list(range(self.num_timesteps))[::-1]
 
         if progress:
@@ -863,7 +865,7 @@ class GaussianDiffusion:
         if noise is not None:
             img = noise
         else:
-            img = th.randn(*shape, device=device)
+            img = th.randn(*shape, device=device) * self.noise_factor
         indices = list(range(self.num_timesteps))[::-1]
 
         if progress:
@@ -923,7 +925,7 @@ class GaussianDiffusion:
         else:
             t_batch = th.tensor([self.num_timesteps - 1] * shape[0], device=device)
             partial_enc_with_noise = self.q_sample(partial_enc, t_batch)
-            img = th.randn(*shape, device=device)
+            img = th.randn(*shape, device=device) * self.noise_factor
             # print(img.shape, partial_enc_with_noise.shape, partial_mask.shape)
             # img = img[partial_mask] + partial_enc_with_noise[~partial_mask]
             img[~partial_mask] = partial_enc_with_noise[~partial_mask]
@@ -993,7 +995,7 @@ class GaussianDiffusion:
         else:
             t_batch = th.tensor([self.num_timesteps - 1] * shape[0], device=device)
             partial_enc_with_noise = self.q_sample(partial_enc, t_batch)
-            img = th.randn(*shape, device=device)
+            img = th.randn(*shape, device=device) * self.noise_factor
             # print(img.shape, partial_enc_with_noise.shape, partial_mask.shape)
             # img = img[partial_mask] + partial_enc_with_noise[~partial_mask]
             img[~partial_mask] = partial_enc_with_noise[~partial_mask]
@@ -1066,7 +1068,7 @@ class GaussianDiffusion:
             * th.sqrt(1 - alpha_bar / alpha_bar_prev)
         )
         # Equation 12.
-        noise = th.randn_like(x)
+        noise = th.randn_like(x) * self.noise_factor
         mean_pred = (
             out["pred_xstart"] * th.sqrt(alpha_bar_prev)
             + th.sqrt(1 - alpha_bar_prev - sigma ** 2) * eps
@@ -1179,7 +1181,7 @@ class GaussianDiffusion:
         if noise is not None:
             img = noise
         else:
-            img = th.randn(*shape, device=device)
+            img = th.randn(*shape, device=device) * self.noise_factor
         indices = list(range(self.num_timesteps))[::-1]
 
         if progress:
@@ -1360,7 +1362,7 @@ class GaussianDiffusion:
         if model_kwargs is None:
             model_kwargs = {}
         if noise is None:
-            noise = th.randn_like(x_start)
+            noise = th.randn_like(x_start) * self.noise_factor
         x_t = self.q_sample(x_start, t, noise=noise)
 
         terms = {}
@@ -1454,7 +1456,7 @@ class GaussianDiffusion:
         :param x_start_mean:
         :return:
         '''
-        noise = th.randn_like(x_start_mean)
+        noise = th.randn_like(x_start_mean) * self.noise_factor
         # print(std.shape, noise.shape, x_start_mean.shape)
         assert noise.shape == x_start_mean.shape
         # print(x_start_mean.device, noise.device)
@@ -1516,7 +1518,7 @@ class GaussianDiffusion:
         input_ids = input_text['query_ids']
         # attention_mask = input_text['attention_mask_q']
         # attention_mask = get_extended_attention_mask(attention_mask)
-        x_start_mean = model.module.get_embeds(input_ids)
+        x_start_mean = model.get_embeds(input_ids)
         # print("x_start_mean", x_start_mean[0])
         # if self.model_arch == 'conv-unet':
         #     seqlen = int(np.sqrt(input_ids.size(1)))
@@ -1538,10 +1540,10 @@ class GaussianDiffusion:
         # print(x_start_mean.shape, x_start.shape)
         noise = None
         if noise is None:
-            noise = th.randn_like(x_start)
+            noise = th.randn_like(x_start) * self.noise_factor
         # forward diffusion
         x_t = self.q_sample(x_start, t, noise=noise)  # reparametrization trick.
-        get_logits = model.module.get_logits
+        get_logits = model.get_logits
 
         terms = {}
         # print("t: ", t)
@@ -1681,7 +1683,7 @@ class GaussianDiffusion:
         for s2s
         '''
         q_input_ids = input_text['tgt_input_ids'].long().to(t.device)
-        x_start_mean = model.module.get_embeds(q_input_ids)
+        x_start_mean = model.get_embeds(q_input_ids)
         p_input_ids = input_text['src_input_ids'].long().to(t.device)
         p_attention_mask = input_text['src_attention_mask'].long().to(t.device)
 
@@ -1701,9 +1703,9 @@ class GaussianDiffusion:
         x_start = self.get_x_start(x_start_mean, std)
         noise = None
         if noise is None:
-            noise = th.randn_like(x_start)
+            noise = th.randn_like(x_start) * self.noise_factor
         x_t = self.q_sample(x_start, t, noise=noise)  # reparametrization trick.
-        get_logits = model.module.get_logits
+        get_logits = model.get_logits
 
         terms = {}
 
@@ -1799,6 +1801,7 @@ class GaussianDiffusion:
             terms["tT_loss"] = tT_loss
 
             decoder_nll = self.token_discrete_loss(x_start, get_logits, q_input_ids)
+            terms["nll"] = self.token_discrete_loss(model_out_x_start, get_logits, q_input_ids)
             terms["decoder_nll"] = decoder_nll
 
             # assert (model.lm_head.weight == model.word_embedding.weight).all()
@@ -1831,7 +1834,7 @@ class GaussianDiffusion:
         assert 'input_ids' in model_kwargs
         x_start = None
         input_ids = model_kwargs.pop('input_ids').to(t.device)
-        x_start_mean = model.model.module.get_embeds(input_ids)
+        x_start_mean = model.model.get_embeds(input_ids)
         if self.model_arch == 'conv-unet':
             seqlen = int(np.sqrt(input_ids.size(1)))
             x_start_mean = x_start_mean.view(x_start_mean.size(0), seqlen, seqlen, x_start_mean.size(-1)).permute(0, 3,
@@ -1841,9 +1844,9 @@ class GaussianDiffusion:
         x_start = x_start_mean
         # print(x_start_mean.shape, x_start.shape)
         if noise is None:
-            noise = th.randn_like(x_start)
+            noise = th.randn_like(x_start) * self.noise_factor
         x_t = self.q_sample(x_start, t, noise=noise) # reparametrization trick.
-        get_logits = model.model.module.get_logits
+        get_logits = model.model.get_logits
 
         terms = {}
 
@@ -1986,7 +1989,7 @@ class GaussianDiffusion:
         mse = []
         for t in list(range(self.num_timesteps))[::-1]:
             t_batch = th.tensor([t] * batch_size, device=device)
-            noise = th.randn_like(x_start)
+            noise = th.randn_like(x_start) * self.noise_factor
             x_t = self.q_sample(x_start=x_start, t=t_batch, noise=noise)
             # Calculate VLB term at the current timestep
             with th.no_grad():
@@ -2055,7 +2058,7 @@ class GaussianDiffusion:
         mse = []
         for t in list(range(self.num_timesteps))[::-1]:
             t_batch = th.tensor([t] * batch_size, device=device)
-            noise = th.randn_like(x_start)
+            noise = th.randn_like(x_start) * self.noise_factor
             # print(t)
             x_t = self.q_sample(x_start=x_start, t=t_batch, noise=noise)
             # Calculate VLB term at the current timestep

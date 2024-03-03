@@ -236,8 +236,22 @@ def load_s2s_jsonl_data(args, padding_mode, split, tokenizer):
         return NotImplementedError
 
     print("example of src id lists: ", dataset[50][0])
+    print("example of src token lists: ", [tokenizer.decode(i) for i in dataset[50][0][0]])
     print("example of tgt id lists: ", dataset[50][1])
+    print("example of trg token lists: ", [tokenizer.decode(i) for i in dataset[50][1][0]])
     print("total query dataset len :", len(dataset))
+
+
+    # maxim = 0
+    # for i in range(len(dataset)):
+    #     if (dataset[i][1] != 0).sum() > maxim:
+    #         maxim = (dataset[i][1] != 0).sum()
+    # print(maxim)
+    # maxim = 0
+    # for i in range(len(dataset)):
+    #     if (dataset[i][0] != 0).sum() > maxim:
+    #         maxim = (dataset[i][0] != 0).sum()
+    # print(maxim)
 
     return dataset
 
@@ -334,16 +348,32 @@ class S2S_dataset(Dataset):
         self.src = src
         self.tgt = tgt
         self.tokenizer = tokenizer
+        # special_tokens_dict = {'additional_special_tokens': ['<PAGESTART>', '<PAGEEND>', '<SECTIONSTART>',
+        #                                                      '<SECTIONEND>',
+        #                                                      '<TABLESTART>', '<TABLEEND>', '<CELLSTART>', '<CELLEND>',
+        #                                                      '<COLHEADERSTART>',
+        #                                                      '<COLHEADEREND>', '<ROWHEADERSTART>', '<ROWHEADEREND>']}
+        #
+        # num_added_toks = tokenizer.add_special_tokens(special_tokens_dict)
+        # self.tokenizer.add_tokens(["<", "<="])
         self.src_maxlength = src_maxlength
         self.tgt_maxlength = tgt_maxlength
 
     def __getitem__(self, index):
         src_example = self.src[index]
+            # .replace("<page_title>", "<PAGESTAmjRT>").replace("</page_title>", "<PAGEEND>") \
+            #                         .replace("<section_title>", "<SECTIONSTART>").replace("</section_title>", "<SECTIONEND>") \
+            #                         .replace("<table>", "<TABLESTART>").replace("</table>", "<TABLEEND>") \
+            #                         .replace("<cell>", "<CELLSTART>").replace("</cell>", "<CELLEND>") \
+            #                         .replace("<col_header>", "<COLHEADERSTART>").replace("</col_header>", "<COLHEADEREND>") \
+            #                         .replace("<row_header>", "<ROWHEADERSTART>").replace("</row_header>", "<ROWHEADEREND>")
         tgt_example = self.tgt[index]
+
 
         src_input_ids = self.tokenizer.encode(src_example, add_special_tokens=True,
                                         max_length=self.src_maxlength, truncation=True,
                                        padding='max_length',return_tensors='pt')
+
         tgt_input_ids = self.tokenizer.encode(tgt_example, add_special_tokens=True,
                                               max_length=self.tgt_maxlength, truncation=True,
                                               padding='max_length', return_tensors='pt')

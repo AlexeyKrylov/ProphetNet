@@ -22,6 +22,7 @@ def create_model_and_diffusion(
         token_emb_type=args.token_emb_type,
     )
     diffusion = create_gaussian_diffusion(
+        args=args,
         steps=args.diffusion_steps,
         learn_sigma=args.learn_sigma,
         sigma_small=args.sigma_small,
@@ -88,6 +89,7 @@ def create_model(
 create diffusion process
 '''
 def create_gaussian_diffusion(
+        args,
     steps=1000,
     learn_sigma=False,
     sigma_small=False,
@@ -134,6 +136,7 @@ def create_gaussian_diffusion(
     print("Diffusion Loss Type: ", loss_type, "  , Whether to learn sigma: ", learn_sigma)
     print("Diffusion predict xstart: ", predict_xstart)
     return GaussianDiffusion(
+        args=args,
         betas=betas,
         model_mean_type=(
             gd.ModelMeanType.EPSILON if not predict_xstart else gd.ModelMeanType.START_X

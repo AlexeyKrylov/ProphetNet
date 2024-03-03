@@ -7,7 +7,7 @@ import os
 import socket
 
 import blobfile as bf
-from mpi4py import MPI
+# from mpi4py import MPI
 import torch as th
 import torch.distributed as dist
 
@@ -24,20 +24,23 @@ def setup_dist():
     """
     if dist.is_initialized():
         return
-
-    comm = MPI.COMM_WORLD
-    backend = "gloo" if not th.cuda.is_available() else "nccl"
+    backend = "gloo"  # if not th.cuda.is_available() else "nccl" # ADD BY ME (NCCL isn't on Windows)
 
     if backend == "gloo":
         hostname = "localhost"
     else:
         hostname = socket.gethostbyname(socket.getfqdn())
-    os.environ["MASTER_ADDR"] = comm.bcast(hostname, root=0)
-    os.environ["RANK"] = str(comm.rank)
-    os.environ["WORLD_SIZE"] = str(comm.size)
 
-    port = comm.bcast(_find_free_port(), root=0)
+    # if os.environ.get("LOCAL_RANK") is None:
+    os.environ['TORCH_USE_CUDA_DSA'] = '1'
+    os.environ["MASTER_ADDR"] = hostname
+    os.environ["RANK"] = str(0)
+    os.environ["WORLD_SIZE"] = str(1)
+    port = _find_free_port()
+    print(_find_free_port())  # ADD BY ME
     os.environ["MASTER_PORT"] = str(port)
+    os.environ['LOCAL_RANK'] = str(0)
+
     dist.init_process_group(backend=backend, init_method="env://")
 
 
@@ -46,20 +49,17 @@ def dev():
     Get the device to use for torch.distributed.
     """
     if th.cuda.is_available():
-        return th.device(f"cuda:{MPI.COMM_WORLD.Get_rank() % GPUS_PER_NODE}")
+        return th.device(f"cuda:{os.environ['LOCAL_RANK']}")
     return th.device("cpu")
 
 
 def load_state_dict(path, **kwargs):
     """
-    Load a PyTorch file without redundant fetches across MPI ranks.
+    Load a PyTorch file.
     """
-    if MPI.COMM_WORLD.Get_rank() == 0:
-        with bf.BlobFile(path, "rb") as f:
-            data = f.read()
-    else:
-        data = None
-    data = MPI.COMM_WORLD.bcast(data)
+    # if int(os.environ['LOCAL_RANK']) == 0:
+    with bf.BlobFile(path, "rb") as f:
+        data = f.read()
     return th.load(io.BytesIO(data), **kwargs)
 
 
